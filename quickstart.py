@@ -2,7 +2,8 @@ import os
 import json
 import requests
 from typing import Tuple
-from typing import List
+from datetime import datetime, timezone
+import time
 
 _token = os.environ["TOKEN"]
 _url = "https://api.spacetraders.io"
@@ -10,6 +11,19 @@ _url = "https://api.spacetraders.io"
 
 def pprint(data: dict):
     print(json.dumps(data, indent=4))
+
+
+def is_past(timestamp: str) -> bool:
+    datetime_obj = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
+    datetime_obj = datetime_obj.replace(tzinfo=timezone.utc)
+    current_time = datetime.now(timezone.utc)
+    return current_time > datetime_obj
+
+
+def wait_until(timestamp: str):
+    print(f"waiting till {timestamp}")
+    while not is_past(timestamp):
+        time.sleep(10)
 
 
 def get_waypoint_components(waypoint: str) -> Tuple[str, str]:
@@ -148,7 +162,9 @@ def contract_deliver_all_available(
     ship_info = get_ship_info(ship_id)
     cargo_info = ship_info["data"]["cargo"]
 
-    relevant_cargo_symbol = contract_info["data"]["terms"]["deliver"][0]["tradeSymbol"]
+    relevant_cargo_symbol = contract_info["data"][0]["terms"]["deliver"][0][
+        "tradeSymbol"
+    ]
 
     relevant_cargo_units = 0
     for cargo in cargo_info["inventory"]:
@@ -174,7 +190,7 @@ def get_contract_info(contract_id: str) -> dict:
 def contract_is_complete(contract_id: str) -> bool:
     contract = get_contract_info(contract_id)
 
-    deliver_details = contract["data"]["terms"]["deliver"]
+    deliver_details = contract["data"][0]["terms"]["deliver"][0]
     return deliver_details["unitsRequired"] <= deliver_details["unitsFulfilled"]
 
 
@@ -184,7 +200,9 @@ def ready_to_deliver(contract_id: str, ship_id: str) -> bool:
     cargo_info = ship_info["data"]["cargo"]
 
     capacity = cargo_info["capacity"]
-    relevant_cargo_symbol = contract_info["data"]["terms"]["deliver"][0]["tradeSymbol"]
+    relevant_cargo_symbol = contract_info["data"][0]["terms"]["deliver"][0][
+        "tradeSymbol"
+    ]
 
     relevant_cargo_units = 0
     for cargo in cargo_info["inventory"]:
@@ -200,6 +218,30 @@ def ship_is_full(ship_id: str) -> bool:
     return cargo["units"] == cargo["capacity"]
 
 
+def sell_non_contract_goods(ship_id: str, contract_id: str) -> dict:
+    contract_info = get_contract_info(contract_id)
+    ship_info = get_ship_info(ship_id)
+    cargo_info = ship_info["data"]["cargo"]
+
+    relevant_cargo_symbol = contract_info["data"]["terms"]["deliver"][0]["tradeSymbol"]
+
+    for cargo in cargo_info["inventory"]:
+        if cargo["symbol"] != relevant_cargo_symbol:
+            sell_goods(ship_id, cargo["symbol"], cargo["units"])
+
+
+def sell_goods(ship_id: str, symbol: str, units: str) -> dict:
+    response = requests.post(
+        f"{_url}/v2/my/ships/{ship_id}/sell",
+        headers={"Authorization": f"Bearer {_token}"},
+        json={
+            "symbol": symbol,
+            "unit": units,
+        },
+    )
+    return response.json()
+
+
 def contract_automation(
     contract_id: str,
     ship_id: str,
@@ -209,21 +251,31 @@ def contract_automation(
 
     # for each ship
     contract_info = get_contract_info(contract_id)
-    contract_location = contract_info["data"]["terms"]["deliver"][0][
+    contract_location = contract_info["data"][0]["terms"]["deliver"][0][
         "destinationSymbol"
     ]
 
     # do this loop until contract is fulfilled
     while not contract_is_complete(contract_id):
         # navigate to asteroid field
-        ship_navigate(ship_id, asteroid_field)
+        navigation = ship_navigate(ship_id, asteroid_field)
+
+        already_there = False
+        if "error" in navigation:
+            already_there = navigation["error"]["code"] == 4204
+            if navigation["error"]["code"] == 4214:
+                wait_until(navigation["error"]["data"]["arrival"])
+
+        if not already_there:
+            wait_until(navigation["data"]["nav"]["route"]["arrival"])
+
         # dock, refuel, orbit
         ship_dock(ship_id)
         ship_refuel(ship_id)
         ship_orbit(ship_id)
 
         # do this loop until 90% cargo full of contract goods
-        while ready_to_deliver(contract_id, ship_id):
+        while not ready_to_deliver(contract_id, ship_id):
             while not ship_is_full(ship_id):
                 # extract from the asteroid field untill cargo full
                 ship_extract(ship_id)
@@ -232,6 +284,7 @@ def contract_automation(
             ship_dock(ship_id)
 
             # sell non-contract goods
+            sell_non_contract_goods(ship_id, contract_id)
 
             # orbit
             ship_orbit(ship_id)
@@ -242,17 +295,16 @@ def contract_automation(
         # dock, deliver, refuel, orbit
         ship_dock(ship_id)
 
-        contract_deliver(
+        contract_deliver_all_available(
             contract_id=contract_id,
             ship_id=ship_id,
-            trade_symbol=contract_info["data"]["terms"]["deliver"][0]["tradeSymbol"],
         )
     # fulfill contract
 
 
 def main():
-    output = purchase_ship("SHIP_MINING_DRONE", "X1-ZT91-25027X")
-    pprint(output)
+    # output = purchase_ship("SHIP_MINING_DRONE", "X1-ZT91-25027X")
+    # pprint(output)
 
     contract_automation(
         contract_id="",
